@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef } from "react";
 import { createRoot } from "react-dom/client";
-import { GoogleGenAI, Type } from "@google/genai";
+import { GoogleGenAI, Type, GenerateContentResponse } from "@google/genai";
 import { 
   ArrowRight, 
   Check, 
@@ -11,7 +11,13 @@ import {
   Users, 
   Target, 
   Layers, 
-  FileText 
+  FileText,
+  Lock,
+  CreditCard,
+  ShieldCheck,
+  Star,
+  ExternalLink,
+  AlertTriangle
 } from "lucide-react";
 
 // --- Types ---
@@ -24,6 +30,7 @@ interface ContentData {
   chapters: Array<{
     title: string;
     content: string;
+    image?: string;
   }>;
 }
 
@@ -44,7 +51,7 @@ interface Answers {
   level: string;
 }
 
-// --- Globals ---
+// --- Globals & Constants ---
 declare global {
   interface Window {
     jspdf: any;
@@ -53,14 +60,41 @@ declare global {
 
 // --- AI Service ---
 const generateMaterial = async (answers: Answers, onProgress: (msg: string) => void): Promise<ContentData> => {
+  // Inicialização direta usando a variável de ambiente, sem verificações bloqueantes manuais.
   const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
   
+  // Helper: Exponential Backoff Retry Wrapper
+  const callWithRetry = async <T,>(
+    operationName: string, 
+    fn: () => Promise<T>, 
+    retries = 3, 
+    baseDelay = 4000
+  ): Promise<T> => {
+    for (let i = 0; i < retries; i++) {
+      try {
+        return await fn();
+      } catch (error: any) {
+        const isRateLimit = error?.status === 429 || error?.code === 429 || (error?.message && /quota|limit|429/i.test(error.message));
+        
+        if (isRateLimit && i < retries - 1) {
+          const waitTime = baseDelay * Math.pow(2, i);
+          onProgress(`Alta demanda (${operationName}). Aguardando ${waitTime/1000}s...`);
+          console.warn(`[${operationName}] Rate limit hit. Waiting ${waitTime}ms`);
+          await new Promise(r => setTimeout(r, waitTime));
+          continue;
+        }
+        console.error(`Error in ${operationName}:`, error);
+        throw error;
+      }
+    }
+    throw new Error(`Falha na operação ${operationName} após tentativas.`);
+  };
+
   // STEP 1: Generate Outline & Metadata
-  onProgress("Criando estrutura, capa e sumário...");
+  onProgress("Analisando nicho e criando estrutura...");
   
   const outlinePrompt = `
-    Você é um editor sênior de livros best-sellers.
-    Crie a ESTRUTURA ESTRATÉGICA para um E-book profissional.
+    Você é um editor sênior de livros. Crie a ESTRUTURA para um E-book.
     
     INFORMAÇÕES:
     Tema: ${answers.what}
@@ -69,332 +103,250 @@ const generateMaterial = async (answers: Answers, onProgress: (msg: string) => v
     Objetivo: ${answers.objective}
     Nível: ${answers.level}
 
-    REQUISITOS:
-    1. Defina um Título e Subtítulo altamente vendáveis.
-    2. Crie uma lista de **15 CAPÍTULOS** que cubram o tema profundamente.
-    3. Defina uma cor tema sóbria e profissional (hex).
-    4. Crie um resumo (sinopse) convincente.
+    REQUISITOS JSON:
+    1. Title: Título vendável.
+    2. Subtitle: Subtítulo explicativo.
+    3. Author: Um nome fictício de autoridade no nicho.
+    4. Summary: Sinopse curta (2 frases).
+    5. ColorTheme: Um código HEX de cor profissional (ex: #1e293b).
+    6. ChapterTitles: Array com exatamente 5 títulos de capítulos.
   `;
 
-  const outlineResponse = await ai.models.generateContent({
-    model: "gemini-3-flash-preview",
-    contents: outlinePrompt,
-    config: {
-      responseMimeType: "application/json",
-      responseSchema: {
-        type: Type.OBJECT,
-        properties: {
-          title: { type: Type.STRING },
-          subtitle: { type: Type.STRING },
-          author: { type: Type.STRING, description: "Nome do especialista/autor" },
-          summary: { type: Type.STRING },
-          colorTheme: { type: Type.STRING },
-          chapterTitles: { 
-            type: Type.ARRAY, 
-            items: { type: Type.STRING },
-            description: "Lista exata de 15 títulos de capítulos"
+  let outline: OutlineData;
+
+  try {
+      const outlineResponse = await callWithRetry<GenerateContentResponse>("Gerar Estrutura", () => ai.models.generateContent({
+        model: "gemini-3-flash-preview",
+        contents: outlinePrompt,
+        config: {
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              title: { type: Type.STRING },
+              subtitle: { type: Type.STRING },
+              author: { type: Type.STRING },
+              summary: { type: Type.STRING },
+              colorTheme: { type: Type.STRING },
+              chapterTitles: { 
+                type: Type.ARRAY, 
+                items: { type: Type.STRING }
+              }
+            }
           }
         }
-      }
-    }
-  });
+      }));
 
-  if (!outlineResponse.text) throw new Error("Falha ao gerar estrutura.");
-  const outline = JSON.parse(outlineResponse.text) as OutlineData;
-
-  // STEP 2: Generate Content for Chapters (Batched to avoid timeouts)
-  const chapters: Array<{title: string, content: string}> = [];
-  const batchSize = 3; // Process 3 chapters concurrently to avoid rate limits/timeouts
-  
-  const totalChapters = outline.chapterTitles.length;
-
-  for (let i = 0; i < totalChapters; i += batchSize) {
-    const batch = outline.chapterTitles.slice(i, i + batchSize);
-    const startIdx = i + 1;
-    const endIdx = Math.min(i + batchSize, totalChapters);
-    
-    onProgress(`Escrevendo capítulos ${startIdx} a ${endIdx} de ${totalChapters}...`);
-
-    const batchPromises = batch.map(async (chapterTitle) => {
-        const chapterPrompt = `
-            Atue como o autor do livro "${outline.title}".
-            Escreva o CONTEÚDO COMPLETO para o capítulo: "${chapterTitle}".
-            
-            Público: ${answers.who}
-            Nível: ${answers.level}
-            
-            REQUISITOS DO TEXTO:
-            - Texto denso e educativo (aprox. 400-500 palavras).
-            - Use parágrafos claros.
-            - Seja prático: dê exemplos ou passos quando possível.
-            - IMPORTANTE: Retorne APENAS texto corrido. NÃO use formatação Markdown (como **negrito** ou # titulos), pois isso quebra o PDF final.
-        `;
-        
-        try {
-            const result = await ai.models.generateContent({
-                model: "gemini-3-flash-preview",
-                contents: chapterPrompt,
-                config: {
-                    responseMimeType: "application/json",
-                    responseSchema: {
-                        type: Type.OBJECT,
-                        properties: {
-                            content: { type: Type.STRING, description: "O texto completo do capítulo, sem markdown." }
-                        }
-                    }
-                }
-            });
-            const text = result.text ? JSON.parse(result.text).content : "Conteúdo não gerado.";
-            return { title: chapterTitle, content: text };
-        } catch (e) {
-            console.error(`Erro no capítulo ${chapterTitle}`, e);
-            return { title: chapterTitle, content: "Ocorreu um erro ao gerar este capítulo. Tente regenerar o material." };
-        }
-    });
-
-    const batchResults = await Promise.all(batchPromises);
-    chapters.push(...batchResults);
+      if (!outlineResponse.text) throw new Error("Resposta vazia da IA.");
+      outline = JSON.parse(outlineResponse.text) as OutlineData;
+  } catch (e) {
+      console.error("Falha na estrutura:", e);
+      throw new Error("Não foi possível conectar à IA. Verifique sua chave de API ou tente novamente.");
   }
 
-  onProgress("Finalizando formatação...");
+  // STEP 2: Generate Content for Chapters
+  const chapters: Array<{title: string, content: string, image?: string}> = [];
+  const totalChapters = outline.chapterTitles.length;
 
-  return {
-    title: outline.title,
-    subtitle: outline.subtitle,
-    author: outline.author,
-    summary: outline.summary,
-    colorTheme: outline.colorTheme,
-    chapters: chapters
-  };
+  for (let i = 0; i < totalChapters; i++) {
+    const chapterTitle = outline.chapterTitles[i];
+    onProgress(`Escrevendo capítulo ${i + 1}/${totalChapters}: "${chapterTitle}"...`);
+
+    const chapterPrompt = `
+        Escreva o conteúdo para o capítulo: "${chapterTitle}" do livro "${outline.title}".
+        Público: ${answers.who}. Nível: ${answers.level}.
+        
+        Gere um texto educativo, denso e direto (aprox 250 palavras).
+        NÃO use formatação Markdown (negrito, itálico), apenas texto puro e parágrafos.
+    `;
+
+    const imagePrompt = `Minimalist corporate vector illustration for book chapter: "${chapterTitle}" about "${answers.what}". Soft colors, white background.`;
+    
+    try {
+        // Generate Text
+        const textResult = await callWithRetry<GenerateContentResponse>(`Texto Cap ${i+1}`, () => ai.models.generateContent({
+            model: "gemini-3-flash-preview",
+            contents: chapterPrompt,
+            config: {
+                responseMimeType: "application/json",
+                responseSchema: {
+                    type: Type.OBJECT,
+                    properties: {
+                        content: { type: Type.STRING }
+                    }
+                }
+            }
+        }));
+        
+        // Generate Image (Parallel-ish but careful with rate limits)
+        let imageBase64: string | undefined = undefined;
+        try {
+            await new Promise(r => setTimeout(r, 1000)); // Short cooling
+            const imageResult = await callWithRetry<GenerateContentResponse>(`Imagem Cap ${i+1}`, () => ai.models.generateContent({
+                model: "gemini-2.5-flash-image",
+                contents: { parts: [{ text: imagePrompt }] },
+                config: {
+                     imageConfig: { aspectRatio: "16:9" }
+                }
+            }), 1); // Only 1 try for images to be faster
+
+            if (imageResult && imageResult.candidates?.[0]?.content?.parts) {
+                for (const part of imageResult.candidates[0].content.parts) {
+                    if (part.inlineData) {
+                        imageBase64 = `data:${part.inlineData.mimeType};base64,${part.inlineData.data}`;
+                        break;
+                    }
+                }
+            }
+        } catch (imgErr) {
+            console.warn(`Imagem pulada para ${chapterTitle}`, imgErr);
+        }
+
+        const text = textResult.text ? JSON.parse(textResult.text).content : "Conteúdo indisponível.";
+        chapters.push({ title: chapterTitle, content: text, image: imageBase64 });
+
+        // Throttle slightly to respect TPM
+        if (i < totalChapters - 1) await new Promise(resolve => setTimeout(resolve, 2000));
+
+    } catch (e) {
+        console.error(`Erro no capítulo ${chapterTitle}`, e);
+        chapters.push({ title: chapterTitle, content: "Erro na geração deste capítulo. O conteúdo foi omitido.", image: undefined });
+    }
+  }
+
+  onProgress("Finalizando diagramação...");
+  return { ...outline, chapters };
 };
 
 // --- PDF Service ---
 const createPDF = (data: ContentData) => {
   const { jsPDF } = window.jspdf;
-  // Initialize standard A4 PDF
-  const doc = new jsPDF({
-    orientation: 'portrait',
-    unit: 'mm',
-    format: 'a4'
-  });
-  
-  const pageWidth = doc.internal.pageSize.getWidth(); // ~210mm
-  const pageHeight = doc.internal.pageSize.getHeight(); // ~297mm
+  const doc = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
+  const pageWidth = doc.internal.pageSize.getWidth();
+  const pageHeight = doc.internal.pageSize.getHeight();
   const margin = 20;
 
-  // --- Helper Functions ---
   const hexToRgb = (hex: string) => {
-    // Default fallback
     if (!hex || !hex.startsWith('#')) return { r: 30, g: 41, b: 59 };
-    const r = parseInt(hex.slice(1, 3), 16);
-    const g = parseInt(hex.slice(3, 5), 16);
-    const b = parseInt(hex.slice(5, 7), 16);
-    return { r, g, b };
+    return {
+        r: parseInt(hex.slice(1, 3), 16),
+        g: parseInt(hex.slice(3, 5), 16),
+        b: parseInt(hex.slice(5, 7), 16)
+    };
   };
 
   const primaryColor = hexToRgb(data.colorTheme);
 
-  // --- 1. CAPA (Cover) ---
-  // Fundo Total
+  // 1. CAPA
   doc.setFillColor(primaryColor.r, primaryColor.g, primaryColor.b);
   doc.rect(0, 0, pageWidth, pageHeight, "F");
-
-  // Elementos Gráficos Abstratos (Modern Design)
-  doc.setGState(new doc.GState({ opacity: 0.1 }));
-  doc.setFillColor(255, 255, 255);
-  doc.circle(pageWidth, 0, 140, "F"); // Círculo canto superior direito
-  doc.circle(0, pageHeight, 100, "F"); // Círculo canto inferior esquerdo
-  doc.rect(margin, pageHeight / 2, 5, 40, "F"); // Detalhe vertical
-  doc.setGState(new doc.GState({ opacity: 1.0 }));
-
-  // Título
+  
   doc.setTextColor(255, 255, 255);
   doc.setFont("helvetica", "bold");
   doc.setFontSize(42);
   const titleLines = doc.splitTextToSize(data.title.toUpperCase(), pageWidth - (margin * 2.5));
   doc.text(titleLines, margin + 10, 80);
 
-  // Subtítulo
   const subY = 80 + (titleLines.length * 16);
   doc.setFont("helvetica", "normal");
   doc.setFontSize(16);
   doc.setTextColor(220, 220, 220);
   const subtitleLines = doc.splitTextToSize(data.subtitle, pageWidth - (margin * 2.5));
   doc.text(subtitleLines, margin + 10, subY);
-
-  // Badge "Guia Completo"
-  doc.setDrawColor(255, 255, 255);
-  doc.setLineWidth(0.5);
-  doc.line(margin + 10, subY + 20, margin + 40, subY + 20);
   
-  // Autor (Rodapé da capa)
   doc.setFontSize(12);
-  doc.setTextColor(200, 200, 200);
   doc.text(data.author.toUpperCase(), margin + 10, pageHeight - 30);
 
-  // --- 2. SUMÁRIO (Table of Contents) ---
-  doc.addPage();
-  doc.setFillColor(255, 255, 255); // Reset bg
-  
-  // Título do Sumário
-  doc.setFont("times", "bold");
-  doc.setFontSize(24);
-  doc.setTextColor(primaryColor.r, primaryColor.g, primaryColor.b);
-  doc.text("Sumário", margin, 40);
-
-  // Linha decorativa
-  doc.setDrawColor(primaryColor.r, primaryColor.g, primaryColor.b);
-  doc.setLineWidth(1);
-  doc.line(margin, 45, pageWidth - margin, 45);
-
-  // Lista de Capítulos
-  let tocY = 60;
-  doc.setFont("helvetica", "normal");
-  doc.setFontSize(12);
-  doc.setTextColor(60, 60, 60);
-
-  data.chapters.forEach((chapter, index) => {
-    if (tocY > pageHeight - 30) {
-      doc.addPage();
-      tocY = 40;
-    }
-    const chapterNum = String(index + 1).padStart(2, '0');
-    doc.text(`${chapterNum}. ${chapter.title}`, margin, tocY);
-    tocY += 10;
-  });
-
-  // --- 3. CONTEÚDO (Chapters) ---
+  // 2. CONTEÚDO
   const fontSize = 12;
   
   data.chapters.forEach((chapter, index) => {
     doc.addPage();
     
-    // Cabeçalho da página
+    // Header
     doc.setFont("helvetica", "normal");
     doc.setFontSize(9);
     doc.setTextColor(150, 150, 150);
     doc.text(`${data.title}  |  Capítulo ${index + 1}`, margin, 15);
     doc.line(margin, 18, pageWidth - margin, 18);
 
-    // Título do Capítulo (Destaque)
+    // Title
     doc.setFont("times", "bold");
     doc.setFontSize(26);
     doc.setTextColor(primaryColor.r, primaryColor.g, primaryColor.b);
     const titleCapLines = doc.splitTextToSize(chapter.title, pageWidth - (margin * 2));
     doc.text(titleCapLines, margin, 40);
 
-    // Texto do Capítulo
-    doc.setFont("times", "roman"); // Times é melhor para leitura longa
+    let currentY = 40 + (titleCapLines.length * 12) + 10;
+
+    // Image
+    if (chapter.image) {
+        try {
+            const imgWidth = pageWidth - (margin * 2);
+            const imgHeight = imgWidth * (9/16);
+            if (currentY + imgHeight > pageHeight - margin) {
+                doc.addPage();
+                currentY = 35;
+            }
+            doc.addImage(chapter.image, 'PNG', margin, currentY, imgWidth, imgHeight);
+            currentY += imgHeight + 10;
+        } catch (err) { console.error("PDF Image Error", err); }
+    }
+
+    // Text
+    doc.setFont("times", "roman");
     doc.setFontSize(fontSize);
     doc.setTextColor(40, 40, 40);
     
-    const startY = 40 + (titleCapLines.length * 12) + 10;
-    
-    // Sanitize content just in case
-    const safeContent = chapter.content || "";
-    const textLines = doc.splitTextToSize(safeContent, pageWidth - (margin * 2));
-    
-    // Renderização manual para controle de página
-    let cursorY = startY;
+    const textLines = doc.splitTextToSize(chapter.content || "", pageWidth - (margin * 2));
     
     textLines.forEach((line: string) => {
-      if (cursorY > pageHeight - margin) {
+      if (currentY > pageHeight - margin) {
         doc.addPage();
-        // Cabeçalho na nova página também
-        doc.setFont("helvetica", "normal");
-        doc.setFontSize(9);
-        doc.setTextColor(150, 150, 150);
-        doc.text(`${data.title}  |  Capítulo ${index + 1} (cont.)`, margin, 15);
-        doc.line(margin, 18, pageWidth - margin, 18);
-        
-        // Reset fonte corpo
-        doc.setFont("times", "roman");
-        doc.setFontSize(fontSize);
-        doc.setTextColor(40, 40, 40);
-        cursorY = 35;
+        currentY = 35;
       }
-      doc.text(line, margin, cursorY);
-      cursorY += (fontSize / 2.5) * 1.8; // Espaçamento de linha
+      doc.text(line, margin, currentY);
+      currentY += (fontSize / 2.5) * 1.8;
     });
   });
-
-  // --- 4. CONTRACAPA (Back Cover) ---
-  doc.addPage();
-  doc.setFillColor(primaryColor.r, primaryColor.g, primaryColor.b);
-  doc.rect(0, 0, pageWidth, pageHeight, "F");
-
-  // Texto de fechamento
-  doc.setTextColor(255, 255, 255);
-  doc.setFont("helvetica", "bold");
-  doc.setFontSize(22);
-  doc.text("Resumo do Material", margin, 60);
-
-  doc.setFont("helvetica", "normal");
-  doc.setFontSize(14);
-  const summaryLines = doc.splitTextToSize(data.summary, pageWidth - (margin * 2));
-  doc.text(summaryLines, margin, 80);
-
-  // Logo ou Brand final
-  doc.setFontSize(10);
-  doc.setTextColor(200, 200, 200);
-  doc.text("Gerado com ProntoPDF", pageWidth / 2, pageHeight - 20, { align: "center" });
-
-  // --- 5. AGRADECIMENTOS (Acknowledgements) ---
-  doc.addPage();
-  doc.setFillColor(255, 255, 255); // White bg
-  doc.rect(0, 0, pageWidth, pageHeight, "F");
-
-  // Header/Title
-  doc.setFont("times", "bold");
-  doc.setFontSize(24);
-  doc.setTextColor(primaryColor.r, primaryColor.g, primaryColor.b);
-  doc.text("Agradecimentos", margin, 40);
-
-  // Decorative Line
-  doc.setDrawColor(primaryColor.r, primaryColor.g, primaryColor.b);
-  doc.setLineWidth(0.5);
-  doc.line(margin, 45, pageWidth / 2, 45);
-
-  // Body Text
-  doc.setFont("times", "roman");
-  doc.setFontSize(12);
-  doc.setTextColor(60, 60, 60);
-  
-  const ackText = "Obrigado por dedicar seu tempo à leitura deste material.\n\nEsperamos que o conteúdo compartilhado aqui tenha sido útil e inspirador para sua jornada. O conhecimento é uma ferramenta poderosa de transformação, e ficamos felizes em fazer parte do seu aprendizado.\n\nEste material foi criado com o objetivo de simplificar processos e entregar valor real, permitindo que você foque no que realmente importa: aplicar e evoluir.";
-  
-  const ackLines = doc.splitTextToSize(ackText, pageWidth - (margin * 2));
-  doc.text(ackLines, margin, 60);
-
-  // ProntoPDF Box
-  const boxY = 60 + (ackLines.length * 6) + 30;
-  
-  doc.setDrawColor(200, 200, 200);
-  doc.setLineWidth(0.5);
-  doc.roundedRect(margin, boxY, pageWidth - (margin * 2), 40, 3, 3, "S");
-  
-  doc.setFont("helvetica", "bold");
-  doc.setFontSize(10);
-  doc.setTextColor(primaryColor.r, primaryColor.g, primaryColor.b);
-  doc.text("Tecnologia ProntoPDF", margin + 5, boxY + 10);
-  
-  doc.setFont("helvetica", "normal");
-  doc.setTextColor(100, 100, 100);
-  const toolDesc = "Este documento foi estruturado, redigido e diagramado automaticamente utilizando a inteligência artificial do ProntoPDF.";
-  const toolLines = doc.splitTextToSize(toolDesc, pageWidth - (margin * 2) - 10);
-  doc.text(toolLines, margin + 5, boxY + 20);
 
   doc.save(`${data.title.replace(/[^a-z0-9]/gi, '_').toLowerCase()}.pdf`);
 };
 
+// --- Simulated Payment Utils ---
+const createSimulatedSession = async () => {
+    await new Promise(resolve => setTimeout(resolve, 1500));
+    const currentUrl = new URL(window.location.href);
+    currentUrl.searchParams.set("session_id", "demo_session_" + Math.random().toString(36).substring(7));
+    return { url: currentUrl.toString() };
+}
+
+const verifySimulatedPayment = async (sessionId: string) => {
+    await new Promise(resolve => setTimeout(resolve, 1000));
+    return sessionId.startsWith("demo_session_");
+}
+
+
 // --- Components ---
 
-const Button = ({ children, onClick, variant = "primary", className = "" }: any) => {
+const Button = ({ children, onClick, variant = "primary", className = "", disabled = false }: any) => {
   const baseStyle = "px-8 py-4 rounded-xl font-medium transition-all duration-300 transform active:scale-95 flex items-center justify-center gap-2";
   const variants = {
     primary: "bg-zen-800 text-white hover:bg-zen-900 shadow-lg hover:shadow-xl",
     secondary: "bg-white text-zen-800 border border-zen-200 hover:border-zen-400 hover:bg-zen-50",
     ghost: "text-zen-500 hover:text-zen-800 hover:bg-zen-100",
+    success: "bg-green-600 text-white hover:bg-green-700 shadow-lg hover:shadow-xl",
+    stripe: "bg-[#635BFF] text-white hover:bg-[#5851E3] shadow-lg hover:shadow-[#635BFF]/30",
   };
+  
+  if (disabled) {
+    return (
+        <button disabled className={`${baseStyle} bg-gray-200 text-gray-400 cursor-not-allowed transform-none shadow-none ${className}`}>
+            {children}
+        </button>
+    )
+  }
+
   return (
     <button onClick={onClick} className={`${baseStyle} ${variants[variant as keyof typeof variants]} ${className}`}>
       {children}
@@ -416,6 +368,86 @@ const Card = ({ selected, children, onClick }: any) => (
     {children}
   </div>
 );
+
+const PaymentModal = ({ onClose }: { onClose: () => void }) => {
+    const [loading, setLoading] = useState(false);
+
+    const handleCheckout = async () => {
+        setLoading(true);
+        try {
+            const session = await createSimulatedSession();
+            if (session.url) {
+                window.location.href = session.url;
+            }
+        } catch (e) {
+            console.error(e);
+            alert("Erro na simulação.");
+            setLoading(false);
+        }
+    };
+
+    return (
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4 fade-in">
+            <div className="bg-white rounded-2xl shadow-2xl max-w-md w-full overflow-hidden relative">
+                <button 
+                    onClick={onClose} 
+                    className="absolute top-4 right-4 text-gray-400 hover:text-gray-600"
+                >
+                    ✕
+                </button>
+                
+                <div className="p-8">
+                    <div className="flex items-center gap-3 mb-6">
+                        <div className="w-12 h-12 bg-[#635BFF]/10 rounded-full flex items-center justify-center text-[#635BFF]">
+                            <CreditCard size={24} />
+                        </div>
+                        <div>
+                            <h3 className="text-xl font-bold text-gray-900">Finalizar Compra</h3>
+                            <p className="text-xs text-gray-500">Checkout Simulado (Demo)</p>
+                        </div>
+                    </div>
+
+                    <div className="mb-8 p-6 bg-gray-50 rounded-xl border border-gray-100">
+                        <div className="flex justify-between items-center mb-1">
+                            <span className="font-medium text-gray-700">Plano Premium</span>
+                            <span className="font-bold text-3xl text-gray-900">R$ 29,90</span>
+                        </div>
+                        <div className="h-px bg-gray-200 my-4"></div>
+                        <ul className="text-sm text-gray-600 space-y-3">
+                            <li className="flex items-center gap-2"><Check size={16} className="text-green-500" /> Download do PDF em alta resolução</li>
+                            <li className="flex items-center gap-2"><Check size={16} className="text-green-500" /> Ilustrações profissionais inclusas</li>
+                            <li className="flex items-center gap-2"><Check size={16} className="text-green-500" /> Licença de uso comercial (PLR)</li>
+                        </ul>
+                    </div>
+                    
+                    <div className="bg-yellow-50 border border-yellow-200 p-3 rounded-lg mb-4 flex gap-2">
+                        <AlertTriangle size={16} className="text-yellow-600 shrink-0 mt-0.5" />
+                        <p className="text-xs text-yellow-700">
+                            <strong>Modo Demo:</strong> Nenhuma cobrança real será feita. Clique abaixo para simular o sucesso do pagamento.
+                        </p>
+                    </div>
+
+                    <Button 
+                        onClick={handleCheckout} 
+                        disabled={loading} 
+                        variant="stripe"
+                        className="w-full"
+                    >
+                        {loading ? "Processando..." : (
+                            <>
+                                Simular Pagamento <ArrowRight size={18} />
+                            </>
+                        )}
+                    </Button>
+                    
+                    <div className="mt-4 flex justify-center gap-2 text-gray-400">
+                        <ShieldCheck size={14} /> <span className="text-[10px] uppercase tracking-wider">Ambiente Seguro</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+    );
+};
 
 const StepWizard = ({ onComplete }: { onComplete: (answers: Answers) => void }) => {
   const [step, setStep] = useState(1);
@@ -579,6 +611,49 @@ const App = () => {
   const [answers, setAnswers] = useState<Answers | null>(null);
   const [content, setContent] = useState<ContentData | null>(null);
   const [loadingMessage, setLoadingMessage] = useState("Iniciando...");
+  const [showPayment, setShowPayment] = useState(false);
+  const [isPaid, setIsPaid] = useState(false);
+  const [verifyingPayment, setVerifyingPayment] = useState(false);
+
+  useEffect(() => {
+    // 1. Check for payment return (Demo)
+    const urlParams = new URLSearchParams(window.location.search);
+    const sessionId = urlParams.get('session_id');
+
+    if (sessionId) {
+        setVerifyingPayment(true);
+        setView("generating"); 
+        setLoadingMessage("Confirmando licença...");
+
+        verifySimulatedPayment(sessionId).then(success => {
+            if (success) {
+                setIsPaid(true);
+                setShowPayment(false);
+                // 2. Restore content
+                const saved = localStorage.getItem('prontopdf_backup');
+                if (saved) {
+                    const parsed = JSON.parse(saved);
+                    setAnswers(parsed.answers);
+                    setContent(parsed.content);
+                    setView("result");
+                } else {
+                    setView("landing");
+                }
+            }
+            // Clean URL
+            window.history.replaceState({}, document.title, window.location.pathname);
+            setVerifyingPayment(false);
+        });
+    }
+  }, []);
+
+  // 3. Save state
+  useEffect(() => {
+      if (content && answers) {
+          localStorage.setItem('prontopdf_backup', JSON.stringify({ answers, content }));
+      }
+  }, [content, answers]);
+
 
   const startWizard = () => setView("wizard");
 
@@ -593,35 +668,44 @@ const App = () => {
       });
       setContent(data);
       setView("result");
-    } catch (e) {
+    } catch (e: any) {
       console.error(e);
-      alert("Houve um erro de conexão. O processo demorou muito. Tente novamente.");
+      alert(`Erro: ${e.message || "Não foi possível gerar o conteúdo. Verifique sua conexão."}`);
       setView("landing");
     }
   };
 
   const handleDownload = () => {
+    if (!isPaid) {
+        setShowPayment(true);
+        return;
+    }
     if (content) createPDF(content);
   };
 
   const reset = () => {
-    setAnswers(null);
-    setContent(null);
-    setView("landing");
+    if (confirm("Tem certeza? Você perderá o livro atual.")) {
+        setAnswers(null);
+        setContent(null);
+        setIsPaid(false);
+        setView("landing");
+        localStorage.removeItem('prontopdf_backup');
+    }
   };
 
   return (
     <div className="min-h-screen font-sans text-zen-800 selection:bg-zen-200">
+      {showPayment && <PaymentModal onClose={() => setShowPayment(false)} />}
       
       {/* Header */}
       <nav className="p-6 flex justify-between items-center max-w-6xl mx-auto">
-        <div className="flex items-center gap-2 cursor-pointer" onClick={reset}>
+        <div className="flex items-center gap-2 cursor-pointer" onClick={() => window.location.href = "/"}>
           <div className="w-8 h-8 bg-zen-800 rounded-lg flex items-center justify-center text-white">
             <Sparkles size={16} />
           </div>
           <span className="font-serif font-bold text-xl tracking-tight">ProntoPDF</span>
         </div>
-        {view !== "landing" && (
+        {view !== "landing" && !verifyingPayment && (
           <button onClick={reset} className="text-sm text-zen-500 hover:text-zen-800">Início</button>
         )}
       </nav>
@@ -682,6 +766,16 @@ const App = () => {
                    className="flex-1 p-8 flex flex-col justify-between"
                    style={{ backgroundColor: content.colorTheme }}
                 >
+                    {/* Watermark for unpaid */}
+                    {!isPaid && (
+                        <div className="absolute inset-0 z-20 bg-black/10 backdrop-blur-[2px] flex items-center justify-center">
+                            <div className="bg-white/90 px-6 py-3 rounded-full shadow-lg flex items-center gap-2">
+                                <Lock size={16} className="text-gray-500"/>
+                                <span className="font-bold text-gray-800 text-sm tracking-widest uppercase">Preview Bloqueado</span>
+                            </div>
+                        </div>
+                    )}
+
                     <div className="absolute top-0 right-0 w-40 h-40 bg-white opacity-10 rounded-full translate-x-1/2 -translate-y-1/2"></div>
                     <div className="absolute bottom-0 left-0 w-32 h-32 bg-white opacity-10 rounded-full -translate-x-1/2 translate-y-1/2"></div>
                     
@@ -729,17 +823,32 @@ const App = () => {
               </div>
 
               <div className="flex flex-col sm:flex-row gap-4">
-                <Button onClick={handleDownload} className="flex-1">
-                  <Download size={20} /> Baixar PDF Completo
-                </Button>
+                {isPaid ? (
+                    <Button onClick={handleDownload} variant="success" className="flex-1">
+                        <Download size={20} /> Baixar PDF Completo
+                    </Button>
+                ) : (
+                    <Button onClick={handleDownload} className="flex-1 bg-indigo-600 hover:bg-indigo-700">
+                        <Lock size={18} /> Liberar Acesso (R$ 29,90)
+                    </Button>
+                )}
+                
                 <Button onClick={reset} variant="secondary" className="flex-1">
                   <RefreshCw size={20} /> Criar Novo
                 </Button>
               </div>
               
-              <p className="text-center text-xs text-zen-400">
-                Documento formatado automaticamente com capa, sumário e numeração.
-              </p>
+              <div className="text-center space-y-1">
+                  {isPaid ? (
+                     <p className="text-xs text-green-600 font-medium flex items-center justify-center gap-1">
+                         <Star size={12} fill="currentColor" /> Licença Premium Ativada
+                     </p>
+                  ) : (
+                    <p className="text-xs text-zen-400">
+                        Pagamento único. Acesso vitalício. Garantia de 7 dias.
+                    </p>
+                  )}
+              </div>
             </div>
           </div>
         )}
